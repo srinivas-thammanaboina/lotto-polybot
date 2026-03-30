@@ -191,14 +191,14 @@ impl Default for OrderTracker {
 
 /// The execution engine: takes OrderIntents, submits through the client,
 /// and manages order lifecycle state.
-pub struct ExecutionEngine<C: ExchangeClient> {
+pub struct ExecutionEngine<C: ExchangeClient + ?Sized> {
     client: Arc<C>,
     tracker: Arc<OrderTracker>,
     config: ExecutionConfig,
     event_tx: mpsc::Sender<BotEvent>,
 }
 
-impl<C: ExchangeClient> ExecutionEngine<C> {
+impl<C: ExchangeClient + ?Sized> ExecutionEngine<C> {
     pub fn new(
         client: Arc<C>,
         tracker: Arc<OrderTracker>,

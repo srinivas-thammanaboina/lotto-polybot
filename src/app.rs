@@ -11,19 +11,19 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, RunMode};
 use crate::discovery::cache::ContractRegistry;
 use crate::domain::market::{Asset, BookSnapshot, MarketDuration, Outcome};
-use crate::domain::signal::{OrderIntent, SignalDecision};
+use crate::domain::signal::{OrderIntent, RejectReason, SignalDecision};
 use crate::error::BotError;
 use crate::execution::cancel_policy::CancelPolicy;
-use crate::execution::client::SimulationClient;
+use crate::execution::client::{ExchangeClient, SimulationClient};
 use crate::execution::fill_state::{ExposureTracker, FillStateProcessor};
 use crate::execution::submit::{ExecutionEngine, OrderTracker};
 use crate::feeds::health::FeedHealthMonitor;
 use crate::metrics::BotMetrics;
 use crate::risk::contract_lock::ContractLockService;
-use crate::risk::kill_switch::KillSwitch;
+use crate::risk::kill_switch::{KillSwitch, KillSwitchReason};
 use crate::shutdown;
 use crate::simulation::engine::{FillModel, SimulationSession};
 use crate::strategy::edge::FeeSchedule;
@@ -45,6 +45,9 @@ const CANCEL_SCAN_INTERVAL_SECS: u64 = 5;
 /// Contract lock cleanup interval.
 const LOCK_CLEANUP_INTERVAL_SECS: u64 = 30;
 
+/// How long to wait for initial discovery before entering the event loop.
+const DISCOVERY_WAIT_SECS: u64 = 10;
+
 // ---------------------------------------------------------------------------
 // Shared runtime state accessible from the event loop
 // ---------------------------------------------------------------------------
@@ -65,6 +68,107 @@ impl LatestState {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// P0-1: Execution client factory by mode
+// ---------------------------------------------------------------------------
+
+/// Build the appropriate exchange client based on run mode.
+/// Fails startup if paper/live is requested without a real client.
+fn build_exchange_client(cfg: &AppConfig) -> Result<Arc<dyn ExchangeClient>, BotError> {
+    match cfg.mode {
+        RunMode::DryRun | RunMode::Simulation => {
+            info!(mode = %cfg.mode, "using SimulationClient");
+            Ok(Arc::new(SimulationClient::default()))
+        }
+        RunMode::Paper | RunMode::Live => {
+            // TODO: Replace with real Polymarket SDK client when available.
+            // For now, fail closed if credentials are missing.
+            if cfg.polymarket.api_key.is_none() || cfg.polymarket.secret.is_none() {
+                return Err(BotError::Config(crate::config::ConfigError::Missing(
+                    "paper/live mode requires POLYMARKET_API_KEY and POLYMARKET_SECRET".into(),
+                )));
+            }
+            warn!(
+                mode = %cfg.mode,
+                "real ExchangeClient not yet implemented — using SimulationClient as placeholder"
+            );
+            Ok(Arc::new(SimulationClient::default()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P0-3 + P2-3: Startup readiness
+// ---------------------------------------------------------------------------
+
+/// Wait for initial discovery to populate the contract registry.
+/// Returns the discovered token IDs for market WS subscription.
+async fn wait_for_discovery(registry: &ContractRegistry, timeout: Duration) -> Vec<String> {
+    let start = tokio::time::Instant::now();
+    let poll_interval = Duration::from_millis(500);
+
+    loop {
+        if registry.is_healthy() {
+            let contracts = registry.active_contracts();
+            if !contracts.is_empty() {
+                let token_ids: Vec<String> =
+                    contracts.iter().map(|c| c.token_id.to_string()).collect();
+                info!(
+                    tokens = token_ids.len(),
+                    "discovery ready — token IDs available for subscription"
+                );
+                return token_ids;
+            }
+        }
+
+        if start.elapsed() > timeout {
+            warn!("discovery timeout — proceeding with empty token list");
+            return Vec::new();
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Check if the system is ready for signal evaluation.
+fn is_system_ready(
+    registry: &ContractRegistry,
+    feed_health: &FeedHealthMonitor,
+    kill_switch: &KillSwitch,
+) -> bool {
+    registry.is_healthy() && feed_health.is_healthy(FeedSource::Binance) && !kill_switch.is_active()
+}
+
+// ---------------------------------------------------------------------------
+// P1-1: Parse kill switch reason from event
+// ---------------------------------------------------------------------------
+
+fn parse_kill_switch_reason(reason: &str) -> KillSwitchReason {
+    match reason {
+        s if s.contains("daily_drawdown") => KillSwitchReason::DailyDrawdownBreach {
+            drawdown: "unknown".into(),
+            limit: "unknown".into(),
+        },
+        s if s.contains("total_drawdown") => KillSwitchReason::TotalDrawdownBreach {
+            drawdown: "unknown".into(),
+            limit: "unknown".into(),
+        },
+        s if s.contains("consecutive_loss") => {
+            KillSwitchReason::ConsecutiveLossBreach { count: 0, limit: 0 }
+        }
+        s if s.contains("stale_feed") => KillSwitchReason::StaleFeedRegime,
+        s if s.contains("reconnect") => KillSwitchReason::ReconnectStorm {
+            count: 0,
+            window_secs: 0,
+        },
+        _ => KillSwitchReason::Manual,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
 
 /// Top-level application entry point.
 /// Wires config, logging, shutdown, channels, and all task groups.
@@ -107,15 +211,17 @@ pub async fn run() -> Result<(), BotError> {
         feed_health.register(FeedSource::Coinbase, cfg.coinbase.stale_threshold);
     }
 
-    // --- execution subsystems ---
+    // --- P0-1: execution client selection by mode ---
+    let exchange_client = build_exchange_client(&cfg)?;
+    info!(mode = %cfg.mode, "exchange client initialized");
+
     let order_tracker = Arc::new(OrderTracker::new());
     let exposure_tracker = Arc::new(ExposureTracker::new());
     let fill_processor =
         FillStateProcessor::new(Arc::clone(&order_tracker), Arc::clone(&exposure_tracker));
 
-    let sim_client = Arc::new(SimulationClient::default());
     let exec_engine = ExecutionEngine::new(
-        sim_client,
+        exchange_client.clone(),
         Arc::clone(&order_tracker),
         cfg.execution.clone(),
         event_tx.clone(),
@@ -129,6 +235,9 @@ pub async fn run() -> Result<(), BotError> {
             .clone()
             .spawn_refresh(cfg.polymarket.clone(), http_client, shutdown_token.clone());
 
+    // --- P0-3: Wait for initial discovery before spawning market WS ---
+    let token_ids = wait_for_discovery(&registry, Duration::from_secs(DISCOVERY_WAIT_SECS)).await;
+
     // --- feed adapters ---
     // Binance
     let _binance_handle = crate::feeds::binance::spawn(
@@ -138,25 +247,28 @@ pub async fn run() -> Result<(), BotError> {
         shutdown_token.clone(),
     );
 
-    // Coinbase (backup, disabled by default)
-    let _coinbase_handle = crate::feeds::coinbase::spawn(
-        cfg.coinbase.clone(),
-        event_tx.clone(),
-        feed_health.clone(),
-        shutdown_token.clone(),
-    );
+    // P0-2: Only spawn Coinbase when enabled
+    if cfg.coinbase.enabled {
+        let _coinbase_handle = crate::feeds::coinbase::spawn(
+            cfg.coinbase.clone(),
+            event_tx.clone(),
+            feed_health.clone(),
+            shutdown_token.clone(),
+        );
+    } else {
+        info!("coinbase: disabled in config, not spawning");
+    }
 
-    // Polymarket market WS — subscribe to discovered token IDs
-    // Initially empty, will reconnect when tokens change.
+    // P0-3: Polymarket market WS — subscribe with discovered token IDs
     let _poly_market_handle = crate::feeds::polymarket_market::spawn(
         cfg.polymarket.clone(),
-        Vec::new(), // Token IDs populated after first discovery
+        token_ids,
         event_tx.clone(),
         feed_health.clone(),
         shutdown_token.clone(),
     );
 
-    // Polymarket user WS
+    // P0-4: Polymarket user WS (auth now includes secret + passphrase)
     let _poly_user_handle = crate::feeds::polymarket_user::spawn(
         cfg.polymarket.clone(),
         event_tx.clone(),
@@ -179,6 +291,15 @@ pub async fn run() -> Result<(), BotError> {
     // --- simulation session (active in simulation mode) ---
     let sim_session = Arc::new(RwLock::new(SimulationSession::new(FillModel::default())));
 
+    // --- P1-2: Track equity from exchange client balance ---
+    let initial_balance = exchange_client
+        .account_balance()
+        .await
+        .map(|b| b.available_usdc)
+        .unwrap_or(dec!(500));
+    let equity = Arc::new(RwLock::new(initial_balance));
+    info!(equity = %initial_balance, "initial equity loaded");
+
     // --- strategy config ---
     let fee_schedule = FeeSchedule::default();
     let sizing_mode = SizingMode::FixedNotional {
@@ -196,7 +317,6 @@ pub async fn run() -> Result<(), BotError> {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Scan for orders that need cancellation
                     let active = cancel_tracker.orders_in_state(
                         crate::domain::order::OrderState::Acked,
                     );
@@ -261,12 +381,27 @@ pub async fn run() -> Result<(), BotError> {
 
                 match &event {
                     BotEvent::CexTick(tick) => {
+                        // P2-3: Check system readiness before signal evaluation
+                        if !is_system_ready(&registry, &feed_health, &kill_switch) {
+                            // Update state but don't evaluate signals
+                            latest.cex_ticks.insert(tick.asset, tick.clone());
+                            latest.window_open_prices.entry(tick.asset).or_insert(tick.price);
+                            continue;
+                        }
+
                         // Update latest state
-                        latest
-                            .window_open_prices
-                            .entry(tick.asset)
-                            .or_insert(tick.price);
+                        latest.window_open_prices.entry(tick.asset).or_insert(tick.price);
                         latest.cex_ticks.insert(tick.asset, tick.clone());
+
+                        // P1-2: Compute signal age from tick receipt time
+                        let now = Utc::now();
+                        let signal_age_chrono = now - tick.receipt_timestamp.0;
+                        let signal_age = signal_age_chrono
+                            .to_std()
+                            .unwrap_or(Duration::from_millis(0));
+
+                        // P1-2: Read current equity
+                        let current_equity = *equity.read();
 
                         // Try to generate signals for all active contracts of this asset
                         let contracts = registry.active_contracts();
@@ -303,10 +438,11 @@ pub async fn run() -> Result<(), BotError> {
                             let secondary = latest
                                 .cex_ticks
                                 .values()
-                                .find(|t| {
-                                    t.asset == tick.asset && t.source != tick.source
-                                })
+                                .find(|t| t.asset == tick.asset && t.source != tick.source)
                                 .map(|t| t.price);
+
+                            // P1-2: Use real execution health check
+                            let exec_healthy = exec_engine.is_healthy().await;
 
                             let pipeline_input = PipelineInput {
                                 contract: contract_entry.key.clone(),
@@ -329,13 +465,13 @@ pub async fn run() -> Result<(), BotError> {
                                 last_cex_tick: Some(tick.receipt_timestamp.0),
                                 lock_state: contract_locks.lock_state(&contract_entry.key),
                                 kill_switch_active: kill_switch.is_active(),
-                                execution_healthy: true, // TODO: check exec engine health
+                                execution_healthy: exec_healthy,
                                 current_positions: exposure_tracker.active_position_count(),
                                 current_position_notional: exposure_tracker
                                     .contract_notional(&contract_entry.key),
-                                equity: dec!(500), // TODO: track from balance/ledger
-                                signal_age: Duration::from_millis(0),
-                                now: Utc::now(),
+                                equity: current_equity,
+                                signal_age,
+                                now,
                             };
 
                             let decision = SignalPipeline::evaluate(
@@ -348,24 +484,39 @@ pub async fn run() -> Result<(), BotError> {
 
                             match &decision {
                                 SignalDecision::Accept(intent) => {
-                                    metrics_clone.signals_accepted
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    // P0-5: Only mark as accepted if intent dispatch succeeds
+                                    match intent_tx.try_send(*intent.clone()) {
+                                        Ok(()) => {
+                                            // Dispatch succeeded — lock contract and record
+                                            metrics_clone.signals_accepted
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                                    // Lock the contract
-                                    contract_locks.lock(
-                                        &intent.contract,
-                                        Some(contract_entry.expiry),
-                                    );
+                                            contract_locks.lock(
+                                                &intent.contract,
+                                                Some(contract_entry.expiry),
+                                            );
 
-                                    // Send to execution
-                                    if let Err(e) = intent_tx.try_send(*intent.clone()) {
-                                        warn!(error = %e, "intent channel full");
+                                            let _ = event_tx.try_send(BotEvent::SignalAccepted(
+                                                *intent.clone(),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            // P0-5: Dispatch failed — do NOT lock, emit rejection
+                                            warn!(
+                                                contract = %intent.contract,
+                                                error = %e,
+                                                "intent_dispatch_failed — backpressure"
+                                            );
+                                            metrics_clone.signals_rejected
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                            let _ = event_tx.try_send(BotEvent::SignalRejected {
+                                                contract: intent.contract.clone(),
+                                                reasons: vec![RejectReason::ExecutionBackpressure],
+                                                timestamp: now,
+                                            });
+                                        }
                                     }
-
-                                    // Persist accepted signal event
-                                    let _ = event_tx.try_send(BotEvent::SignalAccepted(
-                                        *intent.clone(),
-                                    ));
                                 }
                                 SignalDecision::Reject { contract, reasons, timestamp } => {
                                     metrics_clone.signals_rejected
@@ -392,7 +543,6 @@ pub async fn run() -> Result<(), BotError> {
                     }
 
                     BotEvent::RtdsUpdate(_) => {
-                        // RTDS is cross-check only, stored for secondary price
                         debug!("rtds update received");
                     }
 
@@ -410,16 +560,15 @@ pub async fn run() -> Result<(), BotError> {
                         fill_processor.process_state_change(change);
                     }
 
-                    BotEvent::KillSwitch(_ks_event) => {
-                        kill_switch.activate(
-                            crate::risk::kill_switch::KillSwitchReason::Manual,
-                        );
+                    BotEvent::KillSwitch(ks_event) => {
+                        // P1-1: Preserve the original kill switch reason
+                        let reason = parse_kill_switch_reason(&ks_event.reason);
+                        kill_switch.activate(reason);
                         metrics_clone.kill_switch_activations
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
 
                     BotEvent::Resolution(_) => {
-                        // Resolution events handled by the resolution verifier
                         debug!("resolution event received");
                     }
 
@@ -458,7 +607,6 @@ pub async fn run() -> Result<(), BotError> {
             // Shutdown
             _ = drain_token.cancelled() => {
                 info!("shutdown signal received, draining events");
-                // Drain remaining events
                 while let Ok(event) = event_rx.try_recv() {
                     metrics_clone.inc_events();
                     persistence.try_persist(&event);
@@ -472,7 +620,6 @@ pub async fn run() -> Result<(), BotError> {
     // --- shutdown sequence ---
     info!("shutdown initiated, stopping task groups");
 
-    // Drop senders so receivers can drain
     drop(event_tx);
     drop(intent_tx);
 

@@ -55,10 +55,13 @@ pub fn spawn(
                 Ok((ws_stream, _)) => {
                     let (mut write, mut read) = ws_stream.split();
 
-                    // Auth subscription (will need real auth in later phases)
+                    // Auth subscription — includes all required credentials.
+                    // In production, this should use HMAC signing per Polymarket spec.
                     let auth = serde_json::json!({
                         "type": "auth",
                         "apiKey": config.api_key.as_deref().unwrap_or(""),
+                        "secret": config.secret.as_deref().unwrap_or(""),
+                        "passphrase": config.passphrase.as_deref().unwrap_or(""),
                     });
                     if let Err(e) = write.send(Message::Text(auth.to_string().into())).await {
                         error!(error = %e, "polymarket-user: auth failed");

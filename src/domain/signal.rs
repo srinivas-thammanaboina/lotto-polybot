@@ -34,6 +34,8 @@ pub enum RejectReason {
     ExecutionUnhealthy,
     UnsupportedMarket,
     MaxExposureReached,
+    ExecutionBackpressure,
+    SystemNotReady,
 }
 
 impl std::fmt::Display for RejectReason {
@@ -49,6 +51,8 @@ impl std::fmt::Display for RejectReason {
             RejectReason::ExecutionUnhealthy => "execution_unhealthy",
             RejectReason::UnsupportedMarket => "unsupported_market",
             RejectReason::MaxExposureReached => "max_exposure",
+            RejectReason::ExecutionBackpressure => "execution_backpressure",
+            RejectReason::SystemNotReady => "system_not_ready",
         };
         write!(f, "{s}")
     }
