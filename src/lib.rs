@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod shutdown;
 pub mod simulation;
 pub mod types;
+pub mod validation;
 
 pub mod discovery;
 pub mod domain;
