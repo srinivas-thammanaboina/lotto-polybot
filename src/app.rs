@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{AppConfig, RunMode};
 use crate::discovery::cache::ContractRegistry;
-use crate::domain::market::{Asset, BookSnapshot, MarketDuration, Outcome};
+use crate::domain::market::{Asset, BookSnapshot, MarketDuration};
 use crate::domain::signal::{OrderIntent, RejectReason, SignalDecision};
 use crate::error::BotError;
 use crate::execution::cancel_policy::CancelPolicy;
@@ -22,7 +22,10 @@ use crate::execution::fill_state::{ExposureTracker, FillStateProcessor};
 use crate::execution::submit::{ExecutionEngine, OrderTracker};
 use crate::feeds::health::FeedHealthMonitor;
 use crate::metrics::BotMetrics;
+use crate::resolution::fetcher::ResolutionFetcher;
+use crate::resolution::verifier::{ResolutionVerifier, VerificationInput};
 use crate::risk::contract_lock::ContractLockService;
+use crate::risk::drawdown::DrawdownTracker;
 use crate::risk::kill_switch::{KillSwitch, KillSwitchReason};
 use crate::shutdown;
 use crate::simulation::engine::{FillModel, SimulationSession};
@@ -30,6 +33,7 @@ use crate::strategy::edge::FeeSchedule;
 use crate::strategy::pipeline::{PipelineInput, SignalPipeline};
 use crate::strategy::sizing::SizingMode;
 use crate::telemetry;
+use crate::telemetry::ledger::Ledger;
 use crate::telemetry::persistence::EventPersistence;
 use crate::types::{BotEvent, CexTick, FeedSource};
 
@@ -136,8 +140,11 @@ fn is_system_ready(
     registry: &ContractRegistry,
     feed_health: &FeedHealthMonitor,
     kill_switch: &KillSwitch,
+    coinbase_enabled: bool,
 ) -> bool {
-    registry.is_healthy() && feed_health.is_healthy(FeedSource::Binance) && !kill_switch.is_active()
+    let cex_healthy = feed_health.is_healthy(FeedSource::Binance)
+        || (coinbase_enabled && feed_health.is_healthy(FeedSource::Coinbase));
+    registry.is_healthy() && cex_healthy && !kill_switch.is_active()
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +307,13 @@ pub async fn run() -> Result<(), BotError> {
     let equity = Arc::new(RwLock::new(initial_balance));
     info!(equity = %initial_balance, "initial equity loaded");
 
+    // --- R2-4: drawdown tracker + ledger for resolution handling ---
+    let mut drawdown_tracker =
+        DrawdownTracker::new(initial_balance, cfg.risk.clone(), kill_switch.clone());
+    let mut ledger = Ledger::new(cfg.mode);
+    let resolution_fetcher =
+        ResolutionFetcher::new(reqwest::Client::new(), &cfg.polymarket.rest_base_url);
+
     // --- strategy config (P1-3: fee schedule from config, not hardcoded default) ---
     let fee_schedule = FeeSchedule::from_config(&cfg.strategy.fees);
     let sizing_mode = SizingMode::FixedNotional {
@@ -382,7 +396,7 @@ pub async fn run() -> Result<(), BotError> {
                 match &event {
                     BotEvent::CexTick(tick) => {
                         // P2-3: Check system readiness before signal evaluation
-                        if !is_system_ready(&registry, &feed_health, &kill_switch) {
+                        if !is_system_ready(&registry, &feed_health, &kill_switch, cfg.coinbase.enabled) {
                             // Update state but don't evaluate signals
                             latest.cex_ticks.insert(tick.asset, tick.clone());
                             latest.window_open_prices.entry(tick.asset).or_insert(tick.price);
@@ -426,14 +440,8 @@ pub async fn run() -> Result<(), BotError> {
                                 .copied()
                                 .unwrap_or(tick.price);
 
-                            let outcome = if contract_entry.token_id.0.contains("up")
-                                || contract_entry.token_id.0.contains("Up")
-                                || contract_entry.token_id.0.contains("UP")
-                            {
-                                Outcome::Up
-                            } else {
-                                Outcome::Down
-                            };
+                            // R2-3: Outcome from registry metadata, not string heuristic
+                            let outcome = contract_entry.outcome;
 
                             let secondary = latest
                                 .cex_ticks
@@ -461,7 +469,10 @@ pub async fn run() -> Result<(), BotError> {
                                 secondary_price: secondary,
                                 book: book.cloned(),
                                 market_price,
-                                cex_feed_healthy: feed_health.is_healthy(FeedSource::Binance),
+                                // R2-7: Check primary OR backup CEX health
+                                cex_feed_healthy: feed_health.is_healthy(FeedSource::Binance)
+                                    || (cfg.coinbase.enabled
+                                        && feed_health.is_healthy(FeedSource::Coinbase)),
                                 last_cex_tick: Some(tick.receipt_timestamp.0),
                                 lock_state: contract_locks.lock_state(&contract_entry.key),
                                 kill_switch_active: kill_switch.is_active(),
@@ -568,8 +579,59 @@ pub async fn run() -> Result<(), BotError> {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
 
-                    BotEvent::Resolution(_) => {
-                        debug!("resolution event received");
+                    BotEvent::Resolution(res_event) => {
+                        // R2-4: Wire resolution into ledger + drawdown + lock release
+                        info!(
+                            market_id = %res_event.market_id,
+                            winning_token = ?res_event.winning_token,
+                            "resolution_event_processing"
+                        );
+
+                        // Release contract lock for this market's tokens
+                        let market_contracts = registry.active_contracts();
+                        for entry in market_contracts.iter().filter(|c| c.market_id == res_event.market_id) {
+                            contract_locks.cooldown(&entry.key);
+                        }
+
+                        // Fetch authoritative resolution and verify open ledger entries
+                        match resolution_fetcher.fetch(&res_event.market_id).await {
+                            Ok(resolution_data) => {
+                                let open_entries = ledger.entries().iter()
+                                    .filter(|e| e.is_open() && e.contract.market_id == res_event.market_id)
+                                    .map(|e| (e.id, VerificationInput {
+                                        contract: e.contract.clone(),
+                                        side: e.side,
+                                        entry_price: e.entry_price,
+                                        size: e.size,
+                                        fees_paid: e.fees_paid,
+                                    }))
+                                    .collect::<Vec<_>>();
+
+                                for (ledger_id, input) in &open_entries {
+                                    let result = ResolutionVerifier::verify(input, &resolution_data);
+                                    let verified = ResolutionVerifier::to_verified_outcome(&result);
+                                    ledger.record_resolution(*ledger_id, &verified);
+                                    drawdown_tracker.record_trade(result.realized_pnl, None);
+
+                                    // Update equity
+                                    *equity.write() += result.realized_pnl;
+
+                                    info!(
+                                        contract = %result.contract,
+                                        outcome = ?result.outcome,
+                                        pnl = %result.realized_pnl,
+                                        "resolution_verified_and_recorded"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    market_id = %res_event.market_id,
+                                    error = %e,
+                                    "resolution_fetch_failed"
+                                );
+                            }
+                        }
                     }
 
                     BotEvent::SignalAccepted(_) | BotEvent::SignalRejected { .. } => {
@@ -582,6 +644,10 @@ pub async fn run() -> Result<(), BotError> {
 
             // Process order intents for execution
             Some(intent) = intent_rx.recv() => {
+                // R2-1: Add pending exposure BEFORE submission
+                let pending_notional = intent.size * intent.target_price;
+                exposure_tracker.add_pending(&intent.contract, intent.side, pending_notional);
+
                 match exec_engine.submit_intent(&intent).await {
                     Ok(coid) => {
                         metrics_clone.orders_submitted
@@ -593,12 +659,13 @@ pub async fn run() -> Result<(), BotError> {
                         );
                     }
                     Err(e) => {
+                        // R2-1: Unwind pending exposure on failure
+                        exposure_tracker.remove_pending(&intent.contract, pending_notional);
                         warn!(
                             contract = %intent.contract,
                             error = %e,
                             "order_submission_failed"
                         );
-                        // Unlock contract on submission failure
                         contract_locks.cooldown(&intent.contract);
                     }
                 }

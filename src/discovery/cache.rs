@@ -139,6 +139,7 @@ impl ContractRegistry {
                         token_id: outcome.token_id.clone(),
                         asset: meta.asset,
                         duration: meta.duration,
+                        outcome: outcome.outcome,
                         expiry: meta.expiry,
                         lock_state: LockState::Unlocked,
                         lock_changed_at: None,

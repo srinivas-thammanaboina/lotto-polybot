@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::market::{Asset, ContractKey, MarketDuration, MarketId, TokenId};
+use super::market::{Asset, ContractKey, MarketDuration, MarketId, Outcome, TokenId};
 
 /// Contract lock state — prevents duplicate entries into the same window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +22,8 @@ pub struct ContractEntry {
     pub token_id: TokenId,
     pub asset: Asset,
     pub duration: MarketDuration,
+    /// The outcome direction this token represents (Up or Down).
+    pub outcome: Outcome,
     pub expiry: DateTime<Utc>,
     pub lock_state: LockState,
     pub lock_changed_at: Option<DateTime<Utc>>,
