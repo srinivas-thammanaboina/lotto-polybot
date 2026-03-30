@@ -134,8 +134,7 @@ mod tests {
 
     #[test]
     fn parse_valid_rtds() {
-        let json =
-            r#"{"asset":"BTC","price":"67500.00","timestamp":"2024-01-01T00:00:00Z"}"#;
+        let json = r#"{"asset":"BTC","price":"67500.00","timestamp":"2024-01-01T00:00:00Z"}"#;
         let event = parse_rtds(json, ReceiptTimestamp::now()).unwrap();
         match event {
             BotEvent::RtdsUpdate(update) => {

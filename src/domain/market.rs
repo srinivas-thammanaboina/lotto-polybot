@@ -124,10 +124,7 @@ impl BookSide {
     }
 
     pub fn depth_usdc(&self) -> Decimal {
-        self.levels
-            .iter()
-            .map(|l| l.price * l.size)
-            .sum()
+        self.levels.iter().map(|l| l.price * l.size).sum()
     }
 }
 

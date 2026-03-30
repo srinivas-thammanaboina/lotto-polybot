@@ -71,7 +71,10 @@ pub fn spawn(
                         ]
                     });
 
-                    if let Err(e) = write.send(Message::Text(subscribe.to_string().into())).await {
+                    if let Err(e) = write
+                        .send(Message::Text(subscribe.to_string().into()))
+                        .await
+                    {
                         error!(error = %e, "coinbase: subscribe failed");
                         break;
                     }

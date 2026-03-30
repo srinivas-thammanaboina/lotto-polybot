@@ -152,14 +152,10 @@ fn parse_user_event(text: &str) -> Option<BotEvent> {
                 contract,
                 side,
                 price: Decimal::from_str(msg.price.as_deref()?).ok()?,
-                filled_size: Decimal::from_str(
-                    msg.filled_size.as_deref().or(msg.size.as_deref())?,
-                )
-                .ok()?,
-                remaining_size: Decimal::from_str(
-                    msg.remaining_size.as_deref().unwrap_or("0"),
-                )
-                .unwrap_or_default(),
+                filled_size: Decimal::from_str(msg.filled_size.as_deref().or(msg.size.as_deref())?)
+                    .ok()?,
+                remaining_size: Decimal::from_str(msg.remaining_size.as_deref().unwrap_or("0"))
+                    .unwrap_or_default(),
                 fee: Decimal::from_str(msg.fee.as_deref().unwrap_or("0")).unwrap_or_default(),
                 timestamp,
             }))

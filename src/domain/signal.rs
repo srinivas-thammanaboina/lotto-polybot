@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::market::{ContractKey, MarketDuration, Asset};
+use super::market::{Asset, ContractKey, MarketDuration};
+use crate::strategy::edge::CostSnapshot;
 
 /// Trade side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +57,7 @@ impl std::fmt::Display for RejectReason {
 /// The result of running signal gates on a trade candidate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SignalDecision {
-    Accept(OrderIntent),
+    Accept(Box<OrderIntent>),
     Reject {
         contract: ContractKey,
         reasons: Vec<RejectReason>,
@@ -65,6 +66,10 @@ pub enum SignalDecision {
 }
 
 /// A qualified order intent ready for the execution engine.
+///
+/// This is the contract between strategy and execution. It carries enough
+/// context for replay and debugging without requiring strategy logic in
+/// the execution layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderIntent {
     pub contract: ContractKey,
@@ -76,6 +81,8 @@ pub struct OrderIntent {
     pub fair_value: Decimal,
     pub gross_edge: Decimal,
     pub net_edge: Decimal,
+    pub cost_snapshot: CostSnapshot,
+    pub rationale: String,
     pub model_version: String,
     pub signal_timestamp: DateTime<Utc>,
 }

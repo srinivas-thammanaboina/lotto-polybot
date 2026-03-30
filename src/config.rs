@@ -211,34 +211,22 @@ impl AppConfig {
                     "POLYMARKET_RTDS_WS_URL",
                     "wss://ws-subscriptions-clob.polymarket.com/ws/rtds",
                 ),
-                rest_base_url: env_or(
-                    "POLYMARKET_REST_URL",
-                    "https://clob.polymarket.com",
-                ),
-                discovery_refresh: Duration::from_secs(
-                    env_parse("DISCOVERY_REFRESH_SECS", 30)?,
-                ),
+                rest_base_url: env_or("POLYMARKET_REST_URL", "https://clob.polymarket.com"),
+                discovery_refresh: Duration::from_secs(env_parse("DISCOVERY_REFRESH_SECS", 30)?),
             },
 
             binance: BinanceConfig {
                 ws_url: env_or("BINANCE_WS_URL", "wss://stream.binance.com:9443"),
                 reconnect_backoff_ms: env_parse("BINANCE_RECONNECT_BACKOFF_MS", 1000)?,
                 max_reconnect_attempts: env_parse("BINANCE_MAX_RECONNECT", 10)?,
-                stale_threshold: Duration::from_millis(
-                    env_parse("BINANCE_STALE_MS", 3000)?,
-                ),
+                stale_threshold: Duration::from_millis(env_parse("BINANCE_STALE_MS", 3000)?),
             },
 
             coinbase: CoinbaseConfig {
                 enabled: env_parse("COINBASE_ENABLED", false)?,
-                ws_url: env_or(
-                    "COINBASE_WS_URL",
-                    "wss://ws-feed.exchange.coinbase.com",
-                ),
+                ws_url: env_or("COINBASE_WS_URL", "wss://ws-feed.exchange.coinbase.com"),
                 reconnect_backoff_ms: env_parse("COINBASE_RECONNECT_BACKOFF_MS", 1000)?,
-                stale_threshold: Duration::from_millis(
-                    env_parse("COINBASE_STALE_MS", 5000)?,
-                ),
+                stale_threshold: Duration::from_millis(env_parse("COINBASE_STALE_MS", 5000)?),
             },
 
             strategy: StrategyConfig {
@@ -247,12 +235,14 @@ impl AppConfig {
                     min_confidence: dec_or("STRATEGY_5M_MIN_CONFIDENCE", "0.60")?,
                     min_book_depth_usdc: dec_or("STRATEGY_5M_MIN_DEPTH_USDC", "100")?,
                     max_hold: Duration::from_secs(env_parse("STRATEGY_5M_MAX_HOLD_SECS", 240)?),
-                    stale_feed_tolerance: Duration::from_millis(
-                        env_parse("STRATEGY_5M_STALE_FEED_MS", 2000)?,
-                    ),
-                    stale_book_tolerance: Duration::from_millis(
-                        env_parse("STRATEGY_5M_STALE_BOOK_MS", 3000)?,
-                    ),
+                    stale_feed_tolerance: Duration::from_millis(env_parse(
+                        "STRATEGY_5M_STALE_FEED_MS",
+                        2000,
+                    )?),
+                    stale_book_tolerance: Duration::from_millis(env_parse(
+                        "STRATEGY_5M_STALE_BOOK_MS",
+                        3000,
+                    )?),
                     cooldown: Duration::from_secs(env_parse("STRATEGY_5M_COOLDOWN_SECS", 10)?),
                 },
                 fifteen_min: MarketRegimeThresholds {
@@ -260,17 +250,20 @@ impl AppConfig {
                     min_confidence: dec_or("STRATEGY_15M_MIN_CONFIDENCE", "0.55")?,
                     min_book_depth_usdc: dec_or("STRATEGY_15M_MIN_DEPTH_USDC", "100")?,
                     max_hold: Duration::from_secs(env_parse("STRATEGY_15M_MAX_HOLD_SECS", 780)?),
-                    stale_feed_tolerance: Duration::from_millis(
-                        env_parse("STRATEGY_15M_STALE_FEED_MS", 3000)?,
-                    ),
-                    stale_book_tolerance: Duration::from_millis(
-                        env_parse("STRATEGY_15M_STALE_BOOK_MS", 5000)?,
-                    ),
+                    stale_feed_tolerance: Duration::from_millis(env_parse(
+                        "STRATEGY_15M_STALE_FEED_MS",
+                        3000,
+                    )?),
+                    stale_book_tolerance: Duration::from_millis(env_parse(
+                        "STRATEGY_15M_STALE_BOOK_MS",
+                        5000,
+                    )?),
                     cooldown: Duration::from_secs(env_parse("STRATEGY_15M_COOLDOWN_SECS", 15)?),
                 },
-                latency_decay_buffer: Duration::from_millis(
-                    env_parse("STRATEGY_LATENCY_DECAY_MS", 200)?,
-                ),
+                latency_decay_buffer: Duration::from_millis(env_parse(
+                    "STRATEGY_LATENCY_DECAY_MS",
+                    200,
+                )?),
             },
 
             risk: RiskConfig {
@@ -286,9 +279,10 @@ impl AppConfig {
             execution: ExecutionConfig {
                 max_retry_attempts: env_parse("EXEC_MAX_RETRIES", 2)?,
                 retry_backoff_ms: env_parse("EXEC_RETRY_BACKOFF_MS", 500)?,
-                stale_signal_threshold: Duration::from_millis(
-                    env_parse("EXEC_STALE_SIGNAL_MS", 1000)?,
-                ),
+                stale_signal_threshold: Duration::from_millis(env_parse(
+                    "EXEC_STALE_SIGNAL_MS",
+                    1000,
+                )?),
                 max_concurrent_orders: env_parse("EXEC_MAX_CONCURRENT_ORDERS", 2)?,
             },
 
@@ -303,7 +297,9 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.mode.is_live() {
             if self.polymarket.api_key.is_none() {
-                return Err(ConfigError::Missing("POLYMARKET_API_KEY for live mode".into()));
+                return Err(ConfigError::Missing(
+                    "POLYMARKET_API_KEY for live mode".into(),
+                ));
             }
             if self.risk.max_notional_per_order > Decimal::from(100) {
                 return Err(ConfigError::Invalid {

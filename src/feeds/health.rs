@@ -204,7 +204,11 @@ mod tests {
         monitor.set_state(FeedSource::Binance, ConnectionState::Reconnecting);
 
         let snap = monitor.snapshot();
-        let binance = snap.feeds.iter().find(|f| f.source == FeedSource::Binance).unwrap();
+        let binance = snap
+            .feeds
+            .iter()
+            .find(|f| f.source == FeedSource::Binance)
+            .unwrap();
         assert_eq!(binance.reconnect_count, 2);
     }
 }

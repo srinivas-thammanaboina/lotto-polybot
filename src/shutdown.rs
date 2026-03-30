@@ -8,9 +8,8 @@ pub fn install(token: CancellationToken) {
         let ctrl_c = signal::ctrl_c();
         #[cfg(unix)]
         {
-            let mut sigterm =
-                signal::unix::signal(signal::unix::SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler");
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
             tokio::select! {
                 _ = ctrl_c => {
                     info!("received SIGINT, initiating shutdown");

@@ -68,11 +68,7 @@ impl ContractRegistry {
     }
 
     /// Get all contracts for a given asset and duration.
-    pub fn contracts_for(
-        &self,
-        asset: Asset,
-        duration: MarketDuration,
-    ) -> Vec<ContractEntry> {
+    pub fn contracts_for(&self, asset: Asset, duration: MarketDuration) -> Vec<ContractEntry> {
         self.inner
             .read()
             .entries
@@ -126,9 +122,7 @@ impl ContractRegistry {
 
         // Upsert discovered markets
         for meta in &markets {
-            inner
-                .markets
-                .insert(meta.market_id.clone(), meta.clone());
+            inner.markets.insert(meta.market_id.clone(), meta.clone());
 
             for outcome in &meta.outcomes {
                 let key = ContractKey {
@@ -136,8 +130,10 @@ impl ContractRegistry {
                     token_id: outcome.token_id.clone(),
                 };
 
-                inner.entries.entry(key.clone()).or_insert_with(|| {
-                    ContractEntry {
+                inner
+                    .entries
+                    .entry(key.clone())
+                    .or_insert_with(|| ContractEntry {
                         key,
                         market_id: meta.market_id.clone(),
                         token_id: outcome.token_id.clone(),
@@ -146,8 +142,7 @@ impl ContractRegistry {
                         expiry: meta.expiry,
                         lock_state: LockState::Unlocked,
                         lock_changed_at: None,
-                    }
-                });
+                    });
             }
         }
 

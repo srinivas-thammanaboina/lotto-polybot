@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::PolymarketConfig;
 use crate::domain::market::{BookSide, BookSnapshot, PriceLevel, TokenId};
 use crate::feeds::health::FeedHealthMonitor;
-use crate::types::{BotEvent, BookUpdate, ReceiptTimestamp};
+use crate::types::{BookUpdate, BotEvent, ReceiptTimestamp};
 
 /// Raw Polymarket book message.
 #[derive(Debug, Deserialize)]
@@ -114,7 +114,10 @@ pub fn spawn(
 
             reconnect_attempts += 1;
             let backoff = Duration::from_millis(1000 * u64::from(reconnect_attempts.min(6)));
-            info!(attempt = reconnect_attempts, "polymarket-market: reconnecting");
+            info!(
+                attempt = reconnect_attempts,
+                "polymarket-market: reconnecting"
+            );
 
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {}

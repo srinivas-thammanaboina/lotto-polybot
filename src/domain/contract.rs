@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::market::{ContractKey, MarketDuration, MarketId, TokenId, Asset};
+use super::market::{Asset, ContractKey, MarketDuration, MarketId, TokenId};
 
 /// Contract lock state — prevents duplicate entries into the same window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

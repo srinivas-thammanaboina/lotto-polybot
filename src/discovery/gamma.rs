@@ -51,11 +51,7 @@ pub async fn discover(
     // Query for active crypto markets
     let resp = client
         .get(&url)
-        .query(&[
-            ("active", "true"),
-            ("closed", "false"),
-            ("limit", "100"),
-        ])
+        .query(&[("active", "true"), ("closed", "false"), ("limit", "100")])
         .send()
         .await?
         .error_for_status()?;
@@ -149,9 +145,7 @@ fn detect_asset_duration(question: &str, slug: &str) -> Option<(Asset, MarketDur
         || combined.contains("15min")
     {
         MarketDuration::FifteenMin
-    } else if combined.contains("5 min")
-        || combined.contains("5-min")
-        || combined.contains("5min")
+    } else if combined.contains("5 min") || combined.contains("5-min") || combined.contains("5min")
     {
         MarketDuration::FiveMin
     } else {
@@ -219,8 +213,6 @@ mod tests {
 
     #[test]
     fn reject_unsupported_duration() {
-        assert!(
-            detect_asset_duration("Will Bitcoin go up in 1 hour?", "btc-1h-up").is_none()
-        );
+        assert!(detect_asset_duration("Will Bitcoin go up in 1 hour?", "btc-1h-up").is_none());
     }
 }
