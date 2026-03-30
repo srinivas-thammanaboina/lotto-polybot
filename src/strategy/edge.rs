@@ -42,6 +42,15 @@ impl Default for FeeSchedule {
 }
 
 impl FeeSchedule {
+    /// Build from config (env-driven).
+    pub fn from_config(cfg: &crate::config::FeeConfig) -> Self {
+        Self {
+            maker_rate: cfg.maker_rate,
+            taker_rate: cfg.taker_rate,
+            probability_scaled: cfg.probability_scaled,
+        }
+    }
+
     /// Compute the effective fee rate for a trade at a given probability.
     pub fn effective_rate(&self, probability: Decimal) -> Decimal {
         if self.probability_scaled {
@@ -349,5 +358,48 @@ mod tests {
         assert!(est.costs.entry_slippage >= Decimal::ZERO);
         assert!(est.costs.exit_slippage >= Decimal::ZERO);
         assert!(est.costs.total_cost_frac > Decimal::ZERO);
+    }
+
+    #[test]
+    fn fee_from_config() {
+        let cfg = crate::config::FeeConfig {
+            taker_rate: dec!(0.03),
+            maker_rate: dec!(0.01),
+            probability_scaled: false,
+        };
+        let fees = FeeSchedule::from_config(&cfg);
+        assert_eq!(fees.taker_rate, dec!(0.03));
+        assert_eq!(fees.maker_rate, dec!(0.01));
+        assert!(!fees.probability_scaled);
+    }
+
+    #[test]
+    fn edge_sensitivity_near_fifty_fifty() {
+        // At 50/50, fees are at maximum (taker_rate * 0.50 = 0.01).
+        // A 2% gross edge should barely survive costs.
+        let mut input = base_input();
+        input.fair_value_prob = dec!(0.52);
+        input.market_price = dec!(0.50);
+        let est = EdgeCalculator::compute(&input);
+        // Gross edge = 0.02, costs include 0.01 fee + slippage + decay
+        // This should be very tight or unprofitable
+        assert!(est.gross_edge == dec!(0.02));
+        // Net edge should be less than gross
+        assert!(est.net_edge < est.gross_edge);
+    }
+
+    #[test]
+    fn higher_taker_rate_reduces_net_edge() {
+        let mut input = base_input();
+        let low_fee = EdgeCalculator::compute(&input);
+
+        input.fees = FeeSchedule {
+            maker_rate: dec!(0.00),
+            taker_rate: dec!(0.04), // double the default
+            probability_scaled: true,
+        };
+        let high_fee = EdgeCalculator::compute(&input);
+
+        assert!(high_fee.net_edge < low_fee.net_edge);
     }
 }

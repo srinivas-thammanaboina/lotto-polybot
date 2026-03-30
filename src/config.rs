@@ -130,10 +130,18 @@ pub struct MarketRegimeThresholds {
 }
 
 #[derive(Debug, Clone)]
+pub struct FeeConfig {
+    pub taker_rate: Decimal,
+    pub maker_rate: Decimal,
+    pub probability_scaled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct StrategyConfig {
     pub five_min: MarketRegimeThresholds,
     pub fifteen_min: MarketRegimeThresholds,
     pub latency_decay_buffer: Duration,
+    pub fees: FeeConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +272,11 @@ impl AppConfig {
                     "STRATEGY_LATENCY_DECAY_MS",
                     200,
                 )?),
+                fees: FeeConfig {
+                    taker_rate: dec_or("FEE_TAKER_RATE", "0.02")?,
+                    maker_rate: dec_or("FEE_MAKER_RATE", "0.00")?,
+                    probability_scaled: env_parse("FEE_PROBABILITY_SCALED", true)?,
+                },
             },
 
             risk: RiskConfig {

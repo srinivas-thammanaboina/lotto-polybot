@@ -300,8 +300,8 @@ pub async fn run() -> Result<(), BotError> {
     let equity = Arc::new(RwLock::new(initial_balance));
     info!(equity = %initial_balance, "initial equity loaded");
 
-    // --- strategy config ---
-    let fee_schedule = FeeSchedule::default();
+    // --- strategy config (P1-3: fee schedule from config, not hardcoded default) ---
+    let fee_schedule = FeeSchedule::from_config(&cfg.strategy.fees);
     let sizing_mode = SizingMode::FixedNotional {
         amount: cfg.risk.max_notional_per_order,
     };

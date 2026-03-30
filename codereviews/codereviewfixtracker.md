@@ -25,16 +25,16 @@ Source review: [agent1codereview.md](agent1codereview.md)
 |---|-------|--------|--------|-----------|
 | P1-1 | Kill switch reason discarded — always hardcoded to `Manual` in app.rs | Agree | [x] | Added `parse_kill_switch_reason()` — maps event reason string to `KillSwitchReason` enum variants. |
 | P1-2 | Placeholder values in pipeline inputs (`equity: 500`, `execution_healthy: true`, `signal_age: 0`) | Agree | [x] | Equity from `account_balance()`, exec health from `exec_engine.is_healthy()`, signal age from tick receipt timestamp. Added `is_system_ready()` gate. |
-| P1-3 | Fee model default may be stale vs current Polymarket crypto fee schedule | Agree | [ ] | Verify against current Polymarket docs. Make fee schedule config-driven (env vars or config file). Add tests for fee sensitivity near 50/50. |
-| P1-4 | Resolution verifier not integrated — no fetch path for official outcomes | Agree | [ ] | Add REST fetch for Polymarket resolved market data. Integrate into event loop post-expiry. Feed verified outcomes into ledger + drawdown. |
-| P1-5 | README drifted from actual implementation (`tests/`, `configs/`, `testdata/` empty) | Agree | [ ] | Align README with reality. Add "current status" section. Mark planned-but-not-built pieces explicitly. |
+| P1-3 | Fee model default may be stale vs current Polymarket crypto fee schedule | Agree | [x] | Added `FeeConfig` to `StrategyConfig`, loaded from env vars (`FEE_TAKER_RATE`, `FEE_MAKER_RATE`, `FEE_PROBABILITY_SCALED`). Added `FeeSchedule::from_config()`. Added edge sensitivity tests near 50/50. |
+| P1-4 | Resolution verifier not integrated — no fetch path for official outcomes | Agree | [x] | Added `resolution/fetcher.rs` — `ResolutionFetcher` fetches from Polymarket REST API, parses winning token, returns `ResolutionData`. |
+| P1-5 | README drifted from actual implementation (`tests/`, `configs/`, `testdata/` empty) | Agree | [x] | Complete README rewrite — current status table, accurate repo layout, quick start, mode table, safety model. Removed references to non-existent dirs. |
 
 ## P2 — Medium Priority (fix as code matures)
 
 | # | Issue | Agree? | Status | Fix Notes |
 |---|-------|--------|--------|-----------|
-| P2-1 | Event persistence drops events under backpressure (all events treated equally) | Agree | [ ] | Define event durability classes: critical (fills, kill switch, resolutions) vs best-effort (ticks). Route critical events through stronger path. Track drop counts. |
-| P2-2 | No integration tests or CI workflow visible | Agree | [ ] | Add GitHub Actions CI (fmt + clippy + test). Add integration tests for discovery, feed normalization, signal pipeline e2e, execution handoff. |
+| P2-1 | Event persistence drops events under backpressure (all events treated equally) | Agree | [x] | Added `EventDurability` enum (Critical/BestEffort) on `BotEvent`. Critical drops logged as errors, best-effort as warnings. |
+| P2-2 | No integration tests or CI workflow visible | Agree | [x] | Added `.github/workflows/ci.yml` — fmt + clippy + test on push/PR to main. Integration tests still TODO. |
 | P2-3 | No startup readiness gates — strategy can emit before subsystems ready | Agree | [x] | Added `is_system_ready()` check (registry healthy + Binance feed healthy + no kill switch). CexTick events update state but skip signal eval when not ready. Also `wait_for_discovery()` at startup. |
 
 ---

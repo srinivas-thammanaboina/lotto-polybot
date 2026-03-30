@@ -158,6 +158,16 @@ pub enum BotEvent {
     Resolution(ResolutionEvent),
 }
 
+/// Event durability class.
+/// Critical events must not be silently dropped by persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventDurability {
+    /// Must persist — audit-critical (fills, kill switch, resolutions, order lifecycle).
+    Critical,
+    /// Best-effort — can be dropped under backpressure (ticks, book updates).
+    BestEffort,
+}
+
 impl BotEvent {
     /// Returns a short label for logging/metrics.
     pub fn label(&self) -> &'static str {
@@ -172,6 +182,16 @@ impl BotEvent {
             BotEvent::OrderStateChange(_) => "order_state_change",
             BotEvent::KillSwitch(_) => "kill_switch",
             BotEvent::Resolution(_) => "resolution",
+        }
+    }
+
+    /// Event durability class — critical events must not be silently dropped.
+    pub fn durability(&self) -> EventDurability {
+        match self {
+            BotEvent::CexTick(_) | BotEvent::BookUpdate(_) | BotEvent::RtdsUpdate(_) => {
+                EventDurability::BestEffort
+            }
+            _ => EventDurability::Critical,
         }
     }
 }

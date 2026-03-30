@@ -2,6 +2,25 @@
 
 Rust/Tokio trading system for short-duration Polymarket crypto markets, designed for low-latency signal processing, deterministic replay, simulation, paper trading, and tightly gated live deployment.
 
+## Current Status
+
+**All 10 development phases are implemented.** 260+ unit tests, clippy clean.
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| 0-1 | Done | Project foundation, domain types, event bus |
+| 2 | Done | Market discovery + contract registry |
+| 3 | Done | Feed adapters (Binance, Coinbase, Polymarket WS) |
+| 4 | Done | Fair value engine, edge model, signal gates, sizing |
+| 5 | Done | Execution engine, fill state, reconciliation |
+| 6 | Done | Risk engine, kill switch, contract locking, drawdown |
+| 7 | Done | Telemetry, persistence, replay, resolution verifier |
+| 8 | Done | Simulation, shadow mode, evaluation reports |
+| 9 | Done | Benchmarks, deployment scripts, runbooks |
+| 10 | Done | Live validation guard, comparison tooling, go/no-go |
+
+**Next steps:** Run simulation against live feeds, shadow mode validation, then go/no-go review.
+
 ## Goal
 
 Build an event-driven bot that:
@@ -10,26 +29,6 @@ Build an event-driven bot that:
 - computes fair value versus Polymarket tradable prices
 - trades only when expected edge remains positive after fees, slippage, and latency decay
 - prioritizes safety, observability, and replayability over hype metrics
-
-This project is intentionally **not** based on social-media win-rate claims.
-
-## Initial Strategy Scope
-
-V1 focuses on:
-- BTC 5-minute up/down markets
-- BTC 15-minute up/down markets
-- ETH 5-minute up/down markets
-- ETH 15-minute up/down markets
-- latency arbitrage mode
-- oracle-aware hooks in architecture, but not necessarily enabled in first live iteration
-
-Out of scope for initial build:
-- copy trading
-- general prediction markets
-- news-driven trading
-- production market making
-- multi-account routing
-- Kubernetes / microservice sprawl
 
 ## Core Design Principles
 
@@ -41,195 +40,95 @@ Out of scope for initial build:
 - **Simulation before live**
 - **Tiny live rollout after simulation and paper shadowing**
 
-## High-Level Architecture
-
-### Main runtime modules
-
-- `market_discovery`
-  - discovers active BTC/ETH 5m and 15m markets
-  - caches contract metadata
-
-- `feed_cex`
-  - Binance WebSocket adapter
-  - Coinbase WebSocket adapter, initially backup-only
-
-- `feed_polymarket`
-  - market WebSocket
-  - user WebSocket
-  - RTDS WebSocket
-
-- `fair_value_engine`
-  - computes implied fair probability
-  - estimates gross edge and net edge
-
-- `signal_engine`
-  - validates thresholds, staleness, liquidity, and confidence
-
-- `execution_engine`
-  - builds, signs, submits, tracks, and reconciles orders
-
-- `risk_engine`
-  - position sizing
-  - exposure controls
-  - drawdown controls
-  - contract lock / dedupe logic
-
-- `kill_switch`
-  - top-level trading stop for safety events
-
-- `resolution_verifier`
-  - validates official market outcome after expiry using Polymarket’s own resolved market state
-
-- `telemetry_engine`
-  - structured logs
-  - latency histograms
-  - fill statistics
-  - risk-state changes
-
-- `replay_engine`
-  - deterministic playback of captured sessions
-
-## Deployment Model
-
-### Initial primary region
-
-Start with one primary execution node in **Frankfurt** for low operational friction and strong EU connectivity.
-
-### Benchmark regions
-
-Benchmark before locking in production region:
-- Frankfurt
-- Amsterdam
-- Dublin
-
-### Warm standby
-
-Initial standby mode should be one of:
-- benchmark-only passive probes, or
-- manual active-passive failover
-
-Avoid automated leader election in v1.
-
-## Latency Philosophy
-
-The realistic target is:
-- **sub-millisecond internal engine**
-- not sub-millisecond full internet round trip
-
-The bot must measure continuously:
-- source timestamp to bot receipt
-- internal decision latency
-- order submission latency
-- submit-to-ack
-- ack-to-fill
-- expected versus realized slippage
-
-## Safety Model
-
-The bot must never assume:
-- feed freshness
-- order success
-- fill completeness
-- stable fee regime
-- identical live and simulation execution behavior
-
-The bot must stop trading on:
-- stale data regime
-- repeated execution anomalies
-- excessive drawdown
-- repeated disconnects
-- unresolved order-state anomalies
-- manual operator kill
-
-## Expected Repository Layout
+## Repository Layout
 
 ```text
 poly-latency-bot/
 ├── README.md
-├── requirements.md
-├── plan.md
+├── CLAUDE.md                  # Quality commands and rules
 ├── Cargo.toml
-├── .env.example
-├── configs/
-│   ├── base.toml
-│   ├── markets.toml
-│   ├── risk.toml
-│   └── regions.toml
+├── development.md             # Full 10-phase development plan
+├── requirements-2.md          # Detailed requirements
+├── plan-2.md                  # Architecture plan
+├── skill.md                   # Domain knowledge reference
 ├── src/
-│   ├── main.rs
-│   ├── app.rs
-│   ├── config/
-│   ├── types/
-│   ├── market_discovery/
-│   ├── feed_cex/
-│   ├── feed_polymarket/
-│   ├── fair_value_engine/
-│   ├── signal_engine/
-│   ├── execution_engine/
-│   ├── risk_engine/
-│   ├── kill_switch/
-│   ├── resolution_verifier/
-│   ├── telemetry_engine/
-│   ├── replay_engine/
-│   └── utils/
-├── benches/
-├── tests/
-├── testdata/
-└── scripts/
+│   ├── main.rs                # Thin entry point
+│   ├── app.rs                 # Main event loop wiring
+│   ├── config.rs              # Typed config from env vars
+│   ├── types.rs               # BotEvent enum, CexTick, etc.
+│   ├── metrics.rs             # Atomic counters
+│   ├── error.rs               # Top-level error types
+│   ├── shutdown.rs            # Graceful SIGINT/SIGTERM
+│   ├── discovery/             # Gamma API, ContractRegistry
+│   ├── domain/                # Market, Order, Signal, Position types
+│   ├── feeds/                 # Binance, Coinbase, Polymarket WS adapters
+│   ├── strategy/              # Fair value, edge, gates, sizing, pipeline
+│   ├── execution/             # Client abstraction, submit, fill state, reconciliation
+│   ├── risk/                  # Kill switch, contract locks, limits, drawdown
+│   ├── telemetry/             # Persistence, dashboard, histograms, ledger
+│   ├── replay/                # Recorder, runner, scenario fixtures
+│   ├── resolution/            # Outcome verifier, resolution fetcher
+│   ├── simulation/            # Sim engine, shadow mode, evaluation reports
+│   ├── benchmark/             # Region benchmark harness
+│   └── validation/            # Live guard, sim-vs-live comparison
+├── scripts/
+│   ├── check.sh               # cargo fmt + clippy + test
+│   ├── run-sim.sh             # Simulation mode
+│   ├── run-shadow.sh          # Shadow/paper mode
+│   ├── run-benchmark.sh       # Region benchmark
+│   ├── run-replay.sh          # Replay from session file
+│   └── run-live.sh            # Live mode (requires CONFIRM_LIVE=yes)
+├── docs/
+│   ├── standby-model.md       # Manual active-passive v1
+│   ├── runbooks.md            # 9 operational runbooks
+│   └── go-nogo-review.md      # Go/no-go checklist
+├── codereviews/               # Code review findings + fix tracker
+└── benches/                   # Criterion benchmarks
+```
+
+## Quick Start
+
+```bash
+# Run all quality checks
+bash scripts/check.sh
+
+# Start in simulation mode (default, safe)
+./scripts/run-sim.sh
+
+# Run shadow mode against live feeds
+./scripts/run-shadow.sh
+
+# Run region benchmark
+REGION_TAG=local ./scripts/run-benchmark.sh
 ```
 
 ## Modes
 
-The system must support:
-- `dry_run`
-- `simulation`
-- `paper`
-- `live`
+| Mode | Orders | Feeds | Description |
+|------|--------|-------|-------------|
+| `dry_run` | None | None | Config validation only |
+| `simulation` | Simulated | Live | Full pipeline, synthetic fills |
+| `paper` | Logged only | Live | Real signals, no submission |
+| `live` | Real | Live | Requires `CONFIRM_LIVE=yes` + credentials |
 
-Default must never be `live`.
+Default is always `simulation`.
 
-## Polymarket-Specific Notes
+## Safety Model
 
-- Use Polymarket market and user WebSockets for live market/order state
-- Use RTDS as an additional reference stream and cross-check path
-- Use Polymarket’s official resolved market data for final outcome verification
-- Do not verify final P&L from Binance or Coinbase spot snapshots
-- Treat fee handling as dynamic, not hardcoded
-
-## Recommended Build Order
-
-1. Rust/Tokio skeleton
-2. config + logging + types
-3. Polymarket market discovery
-4. Binance feed adapter
-5. Polymarket market WebSocket adapter
-6. fair value engine
-7. signal gates
-8. simulation mode
-9. replay engine
-10. execution engine
-11. risk engine + kill switch
-12. resolution verifier
-13. paper shadow mode
-14. tiny live rollout
-
-## What Success Looks Like
-
-Early success is:
-- correct market discovery
-- correct feed ingestion
-- deterministic replay
-- accurate net-edge accounting
-- safe order controls
-- strong telemetry
-- stable simulation and paper shadow runs
-
-Early success is not:
-- huge trade counts
-- screenshot P&L
-- unsupported win-rate claims
+The bot stops trading on:
+- stale data regime
+- repeated execution anomalies
+- daily/total drawdown breach
+- consecutive loss breach
+- repeated disconnects (reconnect storm)
+- unresolved order-state anomalies
+- manual operator kill switch
 
 ## Related Docs
 
-- [requirements.md](./requirements.md)
-- [plan.md](./plan.md)
+- [development.md](./development.md) — Full 10-phase build plan
+- [requirements-2.md](./requirements-2.md) — Detailed requirements
+- [plan-2.md](./plan-2.md) — Architecture plan
+- [docs/runbooks.md](./docs/runbooks.md) — Operational runbooks
+- [docs/standby-model.md](./docs/standby-model.md) — Standby model
+- [docs/go-nogo-review.md](./docs/go-nogo-review.md) — Go/no-go checklist

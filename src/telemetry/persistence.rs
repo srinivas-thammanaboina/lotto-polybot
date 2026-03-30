@@ -105,18 +105,35 @@ impl EventPersistence {
     }
 
     /// Try to persist an event. Returns false if the channel is full (event dropped).
+    /// Critical events (fills, kill switch, resolutions, order lifecycle) are logged
+    /// as errors when dropped — best-effort events (ticks) are warnings only.
     pub fn try_persist(&self, event: &BotEvent) -> bool {
+        use crate::types::EventDurability;
+
         match self.tx.try_send(event.clone()) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    event = event.label(),
-                    "persistence_channel_full — event dropped"
-                );
+                match event.durability() {
+                    EventDurability::Critical => {
+                        error!(
+                            event = event.label(),
+                            "CRITICAL persistence_channel_full — audit event dropped"
+                        );
+                    }
+                    EventDurability::BestEffort => {
+                        warn!(
+                            event = event.label(),
+                            "persistence_channel_full — event dropped"
+                        );
+                    }
+                }
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                warn!(event = event.label(), "persistence_channel_closed");
+                error!(
+                    event = event.label(),
+                    "persistence_channel_closed — event lost"
+                );
                 false
             }
         }

@@ -248,6 +248,11 @@ mod tests {
                 cooldown: Duration::from_secs(15),
             },
             latency_decay_buffer: Duration::from_millis(200),
+            fees: crate::config::FeeConfig {
+                taker_rate: dec!(0.02),
+                maker_rate: dec!(0.00),
+                probability_scaled: true,
+            },
         }
     }
 
