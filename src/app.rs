@@ -1,21 +1,70 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
+use parking_lot::RwLock;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
+use crate::discovery::cache::ContractRegistry;
+use crate::domain::market::{Asset, BookSnapshot, MarketDuration, Outcome};
+use crate::domain::signal::{OrderIntent, SignalDecision};
 use crate::error::BotError;
+use crate::execution::cancel_policy::CancelPolicy;
+use crate::execution::client::SimulationClient;
+use crate::execution::fill_state::{ExposureTracker, FillStateProcessor};
+use crate::execution::submit::{ExecutionEngine, OrderTracker};
+use crate::feeds::health::FeedHealthMonitor;
 use crate::metrics::BotMetrics;
+use crate::risk::contract_lock::ContractLockService;
+use crate::risk::kill_switch::KillSwitch;
 use crate::shutdown;
+use crate::simulation::engine::{FillModel, SimulationSession};
+use crate::strategy::edge::FeeSchedule;
+use crate::strategy::pipeline::{PipelineInput, SignalPipeline};
+use crate::strategy::sizing::SizingMode;
 use crate::telemetry;
-use crate::types::BotEvent;
+use crate::telemetry::persistence::EventPersistence;
+use crate::types::{BotEvent, CexTick, FeedSource};
 
 /// Channel capacity for the main event bus.
 const EVENT_BUS_CAPACITY: usize = 4096;
 
 /// Channel capacity for order intents flowing to execution.
 const INTENT_CAPACITY: usize = 256;
+
+/// Cancel policy scan interval.
+const CANCEL_SCAN_INTERVAL_SECS: u64 = 5;
+
+/// Contract lock cleanup interval.
+const LOCK_CLEANUP_INTERVAL_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
+// Shared runtime state accessible from the event loop
+// ---------------------------------------------------------------------------
+
+/// Latest CEX tick per asset, for building pipeline inputs.
+struct LatestState {
+    cex_ticks: HashMap<Asset, CexTick>,
+    books: HashMap<String, BookSnapshot>,
+    window_open_prices: HashMap<Asset, Decimal>,
+}
+
+impl LatestState {
+    fn new() -> Self {
+        Self {
+            cex_ticks: HashMap::new(),
+            books: HashMap::new(),
+            window_open_prices: HashMap::new(),
+        }
+    }
+}
 
 /// Top-level application entry point.
 /// Wires config, logging, shutdown, channels, and all task groups.
@@ -39,62 +88,404 @@ pub async fn run() -> Result<(), BotError> {
     shutdown::install(shutdown_token.clone());
 
     // --- event bus ---
-    // All feed adapters and execution events publish here.
-    // Telemetry, replay recorder, and risk engine consume from here.
     let (event_tx, mut event_rx) = mpsc::channel::<BotEvent>(EVENT_BUS_CAPACITY);
 
     // --- intent channel ---
-    // Signal engine publishes order intents; execution engine consumes.
-    let (_intent_tx, _intent_rx) =
-        mpsc::channel::<crate::domain::signal::OrderIntent>(INTENT_CAPACITY);
+    let (intent_tx, mut intent_rx) = mpsc::channel::<OrderIntent>(INTENT_CAPACITY);
 
-    // --- task groups ---
-    // Each phase will add spawns here. For now just the event drain loop.
+    // --- risk subsystems ---
+    let kill_switch = KillSwitch::new();
+    let contract_locks = ContractLockService::new(
+        Duration::from_secs(30), // post-expiry buffer
+        cfg.strategy.five_min.cooldown,
+    );
+    let feed_health = FeedHealthMonitor::new();
 
-    let metrics_clone = Arc::clone(&metrics);
-    let drain_token = shutdown_token.clone();
-    let drain_handle = tokio::spawn(async move {
+    // Register feeds
+    feed_health.register(FeedSource::Binance, cfg.binance.stale_threshold);
+    if cfg.coinbase.enabled {
+        feed_health.register(FeedSource::Coinbase, cfg.coinbase.stale_threshold);
+    }
+
+    // --- execution subsystems ---
+    let order_tracker = Arc::new(OrderTracker::new());
+    let exposure_tracker = Arc::new(ExposureTracker::new());
+    let fill_processor =
+        FillStateProcessor::new(Arc::clone(&order_tracker), Arc::clone(&exposure_tracker));
+
+    let sim_client = Arc::new(SimulationClient::default());
+    let exec_engine = ExecutionEngine::new(
+        sim_client,
+        Arc::clone(&order_tracker),
+        cfg.execution.clone(),
+        event_tx.clone(),
+    );
+
+    // --- discovery ---
+    let registry = ContractRegistry::new();
+    let http_client = reqwest::Client::new();
+    let _discovery_handle =
+        registry
+            .clone()
+            .spawn_refresh(cfg.polymarket.clone(), http_client, shutdown_token.clone());
+
+    // --- feed adapters ---
+    // Binance
+    let _binance_handle = crate::feeds::binance::spawn(
+        cfg.binance.clone(),
+        event_tx.clone(),
+        feed_health.clone(),
+        shutdown_token.clone(),
+    );
+
+    // Coinbase (backup, disabled by default)
+    let _coinbase_handle = crate::feeds::coinbase::spawn(
+        cfg.coinbase.clone(),
+        event_tx.clone(),
+        feed_health.clone(),
+        shutdown_token.clone(),
+    );
+
+    // Polymarket market WS — subscribe to discovered token IDs
+    // Initially empty, will reconnect when tokens change.
+    let _poly_market_handle = crate::feeds::polymarket_market::spawn(
+        cfg.polymarket.clone(),
+        Vec::new(), // Token IDs populated after first discovery
+        event_tx.clone(),
+        feed_health.clone(),
+        shutdown_token.clone(),
+    );
+
+    // Polymarket user WS
+    let _poly_user_handle = crate::feeds::polymarket_user::spawn(
+        cfg.polymarket.clone(),
+        event_tx.clone(),
+        shutdown_token.clone(),
+    );
+
+    // Polymarket RTDS
+    let _rtds_handle = crate::feeds::polymarket_rtds::spawn(
+        cfg.polymarket.clone(),
+        event_tx.clone(),
+        feed_health.clone(),
+        shutdown_token.clone(),
+    );
+
+    // --- persistence ---
+    let persistence_path = PathBuf::from(&cfg.telemetry.event_log_path);
+    let (persistence, persist_rx) = EventPersistence::new(persistence_path.clone(), 1024);
+    let _persist_handle = EventPersistence::spawn_writer(persistence_path, persist_rx, 100);
+
+    // --- simulation session (active in simulation mode) ---
+    let sim_session = Arc::new(RwLock::new(SimulationSession::new(FillModel::default())));
+
+    // --- strategy config ---
+    let fee_schedule = FeeSchedule::default();
+    let sizing_mode = SizingMode::FixedNotional {
+        amount: cfg.risk.max_notional_per_order,
+    };
+
+    // --- mutable latest-state for the event loop ---
+    let mut latest = LatestState::new();
+
+    // --- periodic tasks ---
+    let cancel_scan_token = shutdown_token.clone();
+    let cancel_tracker = Arc::clone(&order_tracker);
+    let _cancel_scan_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(CANCEL_SCAN_INTERVAL_SECS));
         loop {
             tokio::select! {
-                Some(event) = event_rx.recv() => {
-                    metrics_clone.inc_events();
-                    // Future phases: route to strategy, risk, telemetry, replay
-                    tracing::trace!(event = event.label(), "event received");
-                }
-                _ = drain_token.cancelled() => {
-                    // Drain remaining events before exiting
-                    while let Ok(event) = event_rx.try_recv() {
-                        metrics_clone.inc_events();
-                        tracing::trace!(event = event.label(), "draining event");
+                _ = interval.tick() => {
+                    // Scan for orders that need cancellation
+                    let active = cancel_tracker.orders_in_state(
+                        crate::domain::order::OrderState::Acked,
+                    );
+                    let pending = cancel_tracker.orders_in_state(
+                        crate::domain::order::OrderState::Pending,
+                    );
+                    let partial = cancel_tracker.orders_in_state(
+                        crate::domain::order::OrderState::PartialFill,
+                    );
+
+                    let mut all_active: Vec<_> = active;
+                    all_active.extend(pending);
+                    all_active.extend(partial);
+
+                    if !all_active.is_empty() {
+                        let to_cancel = CancelPolicy::scan_orders(
+                            &all_active,
+                            MarketDuration::FiveMin,
+                            None,
+                            Utc::now(),
+                        );
+                        for (coid, reason) in &to_cancel {
+                            warn!(
+                                client_order_id = %coid,
+                                reason = %reason,
+                                "cancel_policy_triggered"
+                            );
+                        }
                     }
-                    break;
                 }
+                _ = cancel_scan_token.cancelled() => break,
             }
         }
     });
 
-    // --- ready ---
-    info!("all systems ready, waiting for shutdown signal (ctrl-c)");
-    shutdown_token.cancelled().await;
+    let lock_cleanup_token = shutdown_token.clone();
+    let lock_cleanup_svc = contract_locks.clone();
+    let _lock_cleanup_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(LOCK_CLEANUP_INTERVAL_SECS));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    lock_cleanup_svc.cleanup_expired();
+                }
+                _ = lock_cleanup_token.cancelled() => break,
+            }
+        }
+    });
+
+    // --- main event loop ---
+    let metrics_clone = Arc::clone(&metrics);
+    let drain_token = shutdown_token.clone();
+
+    info!("all systems ready, entering main event loop");
+
+    loop {
+        tokio::select! {
+            // Process events from the bus
+            Some(event) = event_rx.recv() => {
+                metrics_clone.inc_events();
+                persistence.try_persist(&event);
+
+                match &event {
+                    BotEvent::CexTick(tick) => {
+                        // Update latest state
+                        latest
+                            .window_open_prices
+                            .entry(tick.asset)
+                            .or_insert(tick.price);
+                        latest.cex_ticks.insert(tick.asset, tick.clone());
+
+                        // Try to generate signals for all active contracts of this asset
+                        let contracts = registry.active_contracts();
+                        for contract_entry in contracts.iter().filter(|c| c.asset == tick.asset) {
+                            if kill_switch.is_active() {
+                                break;
+                            }
+                            if !contract_locks.is_tradeable(&contract_entry.key) {
+                                continue;
+                            }
+
+                            let book_key = contract_entry.token_id.to_string();
+                            let book = latest.books.get(&book_key);
+                            let market_price = book
+                                .and_then(|b| b.bids.best().or(b.asks.best()))
+                                .map(|l| l.price)
+                                .unwrap_or(dec!(0.50));
+
+                            let window_open = latest
+                                .window_open_prices
+                                .get(&tick.asset)
+                                .copied()
+                                .unwrap_or(tick.price);
+
+                            let outcome = if contract_entry.token_id.0.contains("up")
+                                || contract_entry.token_id.0.contains("Up")
+                                || contract_entry.token_id.0.contains("UP")
+                            {
+                                Outcome::Up
+                            } else {
+                                Outcome::Down
+                            };
+
+                            let secondary = latest
+                                .cex_ticks
+                                .values()
+                                .find(|t| {
+                                    t.asset == tick.asset && t.source != tick.source
+                                })
+                                .map(|t| t.price);
+
+                            let pipeline_input = PipelineInput {
+                                contract: contract_entry.key.clone(),
+                                asset: contract_entry.asset,
+                                outcome,
+                                duration: contract_entry.duration,
+                                spot_price: tick.price,
+                                window_open_price: window_open,
+                                short_delta: if window_open > Decimal::ZERO {
+                                    (tick.price - window_open) / window_open
+                                } else {
+                                    Decimal::ZERO
+                                },
+                                momentum: None,
+                                volatility: None,
+                                secondary_price: secondary,
+                                book: book.cloned(),
+                                market_price,
+                                cex_feed_healthy: feed_health.is_healthy(FeedSource::Binance),
+                                last_cex_tick: Some(tick.receipt_timestamp.0),
+                                lock_state: contract_locks.lock_state(&contract_entry.key),
+                                kill_switch_active: kill_switch.is_active(),
+                                execution_healthy: true, // TODO: check exec engine health
+                                current_positions: exposure_tracker.active_position_count(),
+                                current_position_notional: exposure_tracker
+                                    .contract_notional(&contract_entry.key),
+                                equity: dec!(500), // TODO: track from balance/ledger
+                                signal_age: Duration::from_millis(0),
+                                now: Utc::now(),
+                            };
+
+                            let decision = SignalPipeline::evaluate(
+                                &pipeline_input,
+                                &cfg.strategy,
+                                &cfg.risk,
+                                &fee_schedule,
+                                &sizing_mode,
+                            );
+
+                            match &decision {
+                                SignalDecision::Accept(intent) => {
+                                    metrics_clone.signals_accepted
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                    // Lock the contract
+                                    contract_locks.lock(
+                                        &intent.contract,
+                                        Some(contract_entry.expiry),
+                                    );
+
+                                    // Send to execution
+                                    if let Err(e) = intent_tx.try_send(*intent.clone()) {
+                                        warn!(error = %e, "intent channel full");
+                                    }
+
+                                    // Persist accepted signal event
+                                    let _ = event_tx.try_send(BotEvent::SignalAccepted(
+                                        *intent.clone(),
+                                    ));
+                                }
+                                SignalDecision::Reject { contract, reasons, timestamp } => {
+                                    metrics_clone.signals_rejected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                    let _ = event_tx.try_send(BotEvent::SignalRejected {
+                                        contract: contract.clone(),
+                                        reasons: reasons.clone(),
+                                        timestamp: *timestamp,
+                                    });
+                                }
+                            }
+
+                            // Record in simulation session
+                            sim_session.write().process_signal(&decision);
+                        }
+                    }
+
+                    BotEvent::BookUpdate(update) => {
+                        latest.books.insert(
+                            update.token_id.to_string(),
+                            update.snapshot.clone(),
+                        );
+                    }
+
+                    BotEvent::RtdsUpdate(_) => {
+                        // RTDS is cross-check only, stored for secondary price
+                        debug!("rtds update received");
+                    }
+
+                    BotEvent::OrderAck(ack) => {
+                        fill_processor.process_ack(ack);
+                    }
+
+                    BotEvent::Fill(fill) => {
+                        fill_processor.process_fill(fill);
+                        metrics_clone.fills_received
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+
+                    BotEvent::OrderStateChange(change) => {
+                        fill_processor.process_state_change(change);
+                    }
+
+                    BotEvent::KillSwitch(_ks_event) => {
+                        kill_switch.activate(
+                            crate::risk::kill_switch::KillSwitchReason::Manual,
+                        );
+                        metrics_clone.kill_switch_activations
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+
+                    BotEvent::Resolution(_) => {
+                        // Resolution events handled by the resolution verifier
+                        debug!("resolution event received");
+                    }
+
+                    BotEvent::SignalAccepted(_) | BotEvent::SignalRejected { .. } => {
+                        // Already handled above, just persisted
+                    }
+                }
+
+                sim_session.write().record_event();
+            }
+
+            // Process order intents for execution
+            Some(intent) = intent_rx.recv() => {
+                match exec_engine.submit_intent(&intent).await {
+                    Ok(coid) => {
+                        metrics_clone.orders_submitted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            client_order_id = %coid,
+                            contract = %intent.contract,
+                            "order_submitted"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            contract = %intent.contract,
+                            error = %e,
+                            "order_submission_failed"
+                        );
+                        // Unlock contract on submission failure
+                        contract_locks.cooldown(&intent.contract);
+                    }
+                }
+            }
+
+            // Shutdown
+            _ = drain_token.cancelled() => {
+                info!("shutdown signal received, draining events");
+                // Drain remaining events
+                while let Ok(event) = event_rx.try_recv() {
+                    metrics_clone.inc_events();
+                    persistence.try_persist(&event);
+                    tracing::trace!(event = event.label(), "draining event");
+                }
+                break;
+            }
+        }
+    }
 
     // --- shutdown sequence ---
     info!("shutdown initiated, stopping task groups");
 
-    // Drop the sender side so receivers can drain and exit
+    // Drop senders so receivers can drain
     drop(event_tx);
-
-    // Wait for the drain loop to finish
-    if let Err(e) = drain_handle.await {
-        warn!(error = %e, "event drain task panicked");
-    }
+    drop(intent_tx);
 
     let snap = metrics.snapshot();
+    let sim_stats = sim_session.read().stats().clone();
+
     info!(
         events = snap.events_received,
         signals_accepted = snap.signals_accepted,
         signals_rejected = snap.signals_rejected,
         orders = snap.orders_submitted,
         fills = snap.fills_received,
+        sim_pnl = %sim_stats.total_pnl,
         "shutdown complete"
     );
 
